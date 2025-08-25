@@ -4,8 +4,6 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>口腔挑戰賽：熱狗／氣球／棒棒糖</title>
-
-  <!-- ✅ 內嵌 CSS -->
   <style>
     * { box-sizing: border-box; }
     body { font-family: system-ui, "Noto Sans TC", sans-serif; margin: 0; padding: 16px; }
@@ -26,6 +24,11 @@
     button { padding: 8px 12px; border-radius: 10px; border: 1px solid #ddd; background: white; cursor: pointer; }
     button:hover { background: #f5f5f5; }
     select { padding: 6px 10px; border-radius: 8px; border: 1px solid #ccc; }
+
+    /* 相機畫面 */
+    #camWrap { position: relative; width: 320px; }
+    #cam, #camOverlay { width: 320px; height: 240px; border-radius: 8px; border: 1px solid #ddd; display: block; }
+    #camOverlay { position: absolute; left: 0; top: 0; pointer-events: none; }
   </style>
 </head>
 <body>
@@ -36,9 +39,9 @@
       <div class="row">
         <label for="mode">選擇關卡：</label>
         <select id="mode">
-          <option value="hotdog">嘴巴切熱狗（開合次數）</option>
-          <option value="balloon">吹氣球（連續吹氣）</option>
-          <option value="lollipop">舔棒棒糖（快速開合）</option>
+          <option value="hotdog">嘴巴切熱狗（開合次數｜相機）</option>
+          <option value="balloon">吹氣球（連續吹氣｜麥克風）</option>
+          <option value="lollipop">舔棒棒糖（快速開合｜麥克風）</option>
         </select>
         <button id="startBtn">開始</button>
         <button id="resetBtn">重來</button>
@@ -57,14 +60,24 @@
     </section>
 
     <section id="playfield">
-      <!-- Balloon 圓、Hotdog & Lollipop 以進度條呈現 -->
+      <!-- 氣球關卡用 -->
       <canvas id="balloon" width="320" height="240"></canvas>
 
+      <!-- 熱狗關卡（相機 + MAR） -->
       <div id="hotdogUI" class="stack hidden">
         <div class="meter"><div id="hotdogFill"></div></div>
         <p>咀嚼次數目標：<span id="hotdogGoal">12</span></p>
+        <p>嘴型指標 MAR：<span id="marVal">0.00</span>
+          （開口門檻 <span id="marOpen">—</span>；閉口門檻 <span id="marClose">—</span>）
+        </p>
+        <p id="calibTip">請先「閉嘴」保持 1 秒進行校準…</p>
+        <div id="camWrap">
+          <video id="cam" width="320" height="240" playsinline autoplay muted></video>
+          <canvas id="camOverlay" width="320" height="240"></canvas>
+        </div>
       </div>
 
+      <!-- 棒棒糖關卡 -->
       <div id="lollipopUI" class="stack hidden">
         <div class="meter"><div id="lollipopFill"></div></div>
         <p>舔一舔（快速開合）目標：<span id="lollipopGoal">20</span></p>
@@ -77,30 +90,52 @@
       <button id="againBtn">再玩一次</button>
     </section>
 
-    <p class="hint">小提醒：允許麥克風、盡量在安靜環境；若偵測不穩，可改用「大聲 vs 小聲」策略。</p>
-
-    <!-- （備註）若未來要加入相機 + MAR 偵測再開啟
-    <video id="cam" width="320" height="240" playsinline autoplay muted class="hidden"></video>
-    <div class="stack">
-      <p>嘴型指標 MAR：<span id="marVal">0.00</span>
-        （開口門檻 <span id="marOpen">—</span>；閉口門檻 <span id="marClose">—</span>）
-      </p>
-      <p id="calibTip">請先「閉嘴」1 秒進行校準…</p>
-    </div>
-    -->
+    <p class="hint">提示：此頁需 HTTPS 或 localhost。熱狗關卡請讓臉部正對鏡頭、光線充足；若校準多次仍異常，可靠近一些或提高環境光。</p>
   </main>
 
-  <!-- ✅ 內嵌 JS -->
+  <!-- MediaPipe FaceMesh（相機用於熱狗關卡） -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+
   <script>
-    // ====== 基礎麥克風音量偵測 ======
+    // ====== 麥克風（給氣球/棒棒糖） ======
     let audioCtx, analyser, dataArray, micStream;
     let rafId = null;
     const volVal = document.getElementById('volVal');
     const volBar = document.getElementById('volBar');
+
+    async function initAudio() {
+      if (audioCtx) return;
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      } catch (e) {
+        // 若選的是麥克風關卡才提示錯誤
+        if (modeSel.value !== 'hotdog') alert('需要麥克風權限才能遊玩麥克風關卡。');
+        throw e;
+      }
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioCtx.createMediaStreamSource(micStream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      dataArray = new Uint8Array(analyser.fftSize);
+      source.connect(analyser);
+    }
+    function getVolume() {
+      if (!analyser) return 0;
+      analyser.getByteTimeDomainData(dataArray);
+      let sum = 0;
+      for (let i = 0; i < dataArray.length; i++) {
+        const v = (dataArray[i] - 128) / 128;
+        sum += v * v;
+      }
+      return Math.sqrt(sum / dataArray.length);
+    }
+
+    // ====== 共用 UI ======
     const stateText = document.getElementById('stateText');
     const progressText = document.getElementById('progressText');
     const timeText = document.getElementById('timeText');
-
     const startBtn = document.getElementById('startBtn');
     const resetBtn = document.getElementById('resetBtn');
     const againBtn = document.getElementById('againBtn');
@@ -121,43 +156,13 @@
     let startTime = 0;
     let elapsed = 0;
 
-    // 音量（RMS）計算
-    function getVolume() {
-      analyser.getByteTimeDomainData(dataArray);
-      let sum = 0;
-      for (let i = 0; i < dataArray.length; i++) {
-        const v = (dataArray[i] - 128) / 128;
-        sum += v * v;
-      }
-      const rms = Math.sqrt(sum / dataArray.length); // 0~約0.5
-      return rms;
-    }
-
-    // 初始化麥克風
-    async function initAudio() {
-      if (audioCtx) return;
-      try {
-        micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      } catch (e) {
-        alert('需要麥克風權限才能遊玩，請允許麥克風。');
-        throw e;
-      }
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const source = audioCtx.createMediaStreamSource(micStream);
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 1024;
-      dataArray = new Uint8Array(analyser.fftSize);
-      source.connect(analyser);
-    }
-
-    // ====== 共用 UI ======
-    function setState(t) { stateText.textContent = t; }
-    function setProgress(v) { progressText.textContent = v; }
-    function setTime(ms) {
-      const s = Math.floor(ms / 1000);
+    function setState(t){ stateText.textContent = t; }
+    function setProgress(v){ progressText.textContent = v; }
+    function setTime(ms){
+      const s = Math.floor(ms/1000);
       const mm = String(Math.floor(s/60)).padStart(2,'0');
       const ss = String(s%60).padStart(2,'0');
-      timeText.textContent = \`\${mm}:\${ss}\`;
+      timeText.textContent = `${mm}:${ss}`;
     }
     function showResult(title, detail){
       resultTitle.textContent = title;
@@ -166,8 +171,9 @@
     }
     function hideResult(){ result.classList.add('hidden'); }
 
-    // ====== 核心迴圈 ======
+    // ====== 主回圈（根據關卡來源不同傳入 vol 或 mar） ======
     function loop() {
+      // 麥克風（兩關用）
       const vol = getVolume();
       volVal.textContent = vol.toFixed(2);
       volBar.style.width = Math.min(100, (vol * 200)).toFixed(0) + '%';
@@ -179,79 +185,47 @@
       rafId = requestAnimationFrame(loop);
     }
 
-    // ====== 三種關卡的最小邏輯 ======
-    // 參考門檻（可依場地調整）
-    const THRESH_LOUD = 0.12;  // 大聲（吹氣）
-    const THRESH_OPEN = 0.07;  // 嘴巴張開（一般）
-    const HYST = 0.02;         // 回滯避免抖動
+    // ====== 臨界值（麥克風） ======
+    const THRESH_LOUD = 0.12;  // 吹氣
+    const THRESH_OPEN = 0.07;  // 一般開嘴（給棒棒糖）
+    const HYST = 0.02;
 
-    // 1) 熱狗：咀嚼次數（開合次數）
-    function HotdogGame(target=12) {
-      this.target = target;
-      this.count = 0;
-      this.awaitClose = false; // true 表示剛開口，等閉口
-      hotdogGoalEl.textContent = target;
-
-      this.update = (vol) => {
-        // 開口：超過門檻，且原本不是開口狀態
-        if (!this.awaitClose && vol > THRESH_OPEN) {
-          this.awaitClose = true;
-          setState('張口');
-        }
-        // 閉口：低於 (THRESH_OPEN - HYST) 才算一次
-        if (this.awaitClose && vol < (THRESH_OPEN - HYST)) {
-          this.awaitClose = false;
-          this.count++;
-          setProgress(\`\${this.count}/\${this.target}\`);
-          hotdogFill.style.width = \`\${Math.min(100, this.count / this.target * 100)}%\`;
-          setState('閉口');
-          if (this.count >= this.target) {
-            endGame('熱狗切完！', \`你完成 \${this.count} 次咀嚼，用時 \${timeText.textContent}\`);
-          }
-        }
-      };
-    }
-
-    // 2) 氣球：維持大聲吹氣讓半徑成長；沒吹就慢慢縮
+    // ====== 氣球關卡（麥克風） ======
     function BalloonGame(targetRadius=100) {
       this.r = 20;
       this.target = targetRadius;
-
       this.update = (vol) => {
-        if (vol > THRESH_LOUD) {
-          this.r += 1.5; // 吹氣時成長
-          setState('用力吹！');
-        } else {
-          this.r -= 0.6; // 沒吹時緩慢縮
-          setState('再大聲一點');
-        }
+        if (vol > THRESH_LOUD) { this.r += 1.5; setState('用力吹！'); }
+        else { this.r -= 0.6; setState('再大聲一點'); }
         this.r = Math.max(10, Math.min(this.r, this.target + 10));
         const pct = Math.min(100, (this.r / this.target) * 100);
-        setProgress(\`\${pct.toFixed(0)}%\`);
+        setProgress(`${pct.toFixed(0)}%`);
         drawBalloon(this.r);
         if (this.r >= this.target) {
-          endGame('氣球爆囉！', \`你把氣球吹到目標大小，用時 \${timeText.textContent}\`);
+          endGame('氣球爆囉！', `你把氣球吹到目標大小，用時 ${timeText.textContent}`);
         }
       };
     }
+    function drawBalloon(r) {
+      bctx.clearRect(0,0,balloonCanvas.width, balloonCanvas.height);
+      const cx = balloonCanvas.width/2, cy = balloonCanvas.height/2 + 20;
+      bctx.beginPath(); bctx.arc(cx, cy, r, 0, Math.PI*2); bctx.fillStyle = '#f87171'; bctx.fill();
+      bctx.beginPath(); bctx.moveTo(cx, cy + r); bctx.lineTo(cx, cy + r + 60);
+      bctx.strokeStyle = '#555'; bctx.lineWidth = 2; bctx.stroke();
+    }
 
-    // 3) 棒棒糖：快速「小幅」開合視為一次舔（偵測節奏）
+    // ====== 棒棒糖關卡（麥克風，節奏偵測） ======
     function LollipopGame(target=20) {
-      this.target = target;
-      this.count = 0;
-      this.state = 'idle';
-      this.lastPeak = 0;
-
+      this.target = target; this.count = 0; this.lastPeak = 0;
+      lollipopGoalEl.textContent = target;
       this.update = (vol, t) => {
-        // 快速開口峰值（>THRESH_OPEN），兩次峰之間要間隔 > 180ms 避免重複計數
         if (vol > THRESH_OPEN && (t - this.lastPeak) > 180) {
           this.lastPeak = t;
           this.count++;
-          lollipopFill.style.width = \`\${Math.min(100, this.count / this.target * 100)}%\`;
-          setProgress(\`\${this.count}/\${this.target}\`);
-          setState('舔！');
+          lollipopFill.style.width = `${Math.min(100, this.count/this.target*100)}%`;
+          setProgress(`${this.count}/${this.target}`); setState('舔！');
           if (this.count >= this.target) {
-            endGame('棒棒糖舔好！', \`你完成 \${this.count} 次，用時 \${timeText.textContent}\`);
+            endGame('棒棒糖舔好！', `你完成 ${this.count} 次，用時 ${timeText.textContent}`);
           }
         } else if (vol < (THRESH_OPEN - HYST)) {
           setState('準備舔');
@@ -259,47 +233,161 @@
       };
     }
 
-    // 畫氣球
-    function drawBalloon(r) {
-      bctx.clearRect(0, 0, balloonCanvas.width, balloonCanvas.height);
-      const cx = balloonCanvas.width / 2, cy = balloonCanvas.height / 2 + 20;
-      // 球
-      bctx.beginPath();
-      bctx.arc(cx, cy, r, 0, Math.PI * 2);
-      bctx.fillStyle = '#f87171';
-      bctx.fill();
-      // 繩子
-      bctx.beginPath();
-      bctx.moveTo(cx, cy + r);
-      bctx.lineTo(cx, cy + r + 60);
-      bctx.strokeStyle = '#555';
-      bctx.lineWidth = 2;
-      bctx.stroke();
+    // ====== 熱狗關卡（相機 + FaceMesh 計算 MAR） ======
+    // MAR = dist(13,14) / dist(78,308) （使用 normalized 座標）
+    const cam = document.getElementById('cam');
+    const camOverlay = document.getElementById('camOverlay');
+    const octx = camOverlay.getContext('2d');
+    const marValEl = document.getElementById('marVal');
+    const marOpenEl = document.getElementById('marOpen');
+    const marCloseEl = document.getElementById('marClose');
+    const calibTipEl = document.getElementById('calibTip');
+
+    let faceMesh = null;
+    let camera = null;
+    let camStream = null;
+
+    function dist2D(a,b){
+      const dx = a.x - b.x, dy = a.y - b.y;
+      return Math.hypot(dx, dy);
+    }
+
+    function HotdogGame(target=12){
+      this.target = target;
+      this.count = 0;
+      this.awaitClose = false;     // 是否正在等待閉口
+      this.calibrating = true;     // 校準中
+      this.samples = [];           // 收集閉口 MAR 樣本
+      this.base = 0;               // 閉口基準 MAR
+      this.openThr = 0;            // 開口門檻
+      this.closeThr = 0;           // 閉口門檻（回滯）
+      hotdogGoalEl.textContent = target;
+      calibTipEl.textContent = '請先「閉嘴」保持 1 秒進行校準…';
+
+      this.updateMAR = (mar) => {
+        marValEl.textContent = mar.toFixed(3);
+
+        // 校準：收集 1 秒或 30 個樣本
+        if (this.calibrating) {
+          this.samples.push(mar);
+          if (this.samples.length >= 30) {
+            // 取中位數較穩定
+            const sorted = [...this.samples].sort((a,b)=>a-b);
+            const median = sorted[Math.floor(sorted.length/2)];
+            this.base = median;
+            this.openThr = this.base + 0.035; // 開口門檻（可視場地調整）
+            this.closeThr = this.base + 0.020; // 回滯避免抖動
+            marOpenEl.textContent = this.openThr.toFixed(3);
+            marCloseEl.textContent = this.closeThr.toFixed(3);
+            this.calibrating = false;
+            calibTipEl.textContent = '校準完成！開始咀嚼～';
+            setState('校準完成，開始！');
+          }
+          return;
+        }
+
+        // 偵測：開→閉 算一次
+        if (!this.awaitClose && mar > this.openThr) {
+          this.awaitClose = true;
+          setState('張口');
+        }
+        if (this.awaitClose && mar < this.closeThr) {
+          this.awaitClose = false;
+          this.count++;
+          hotdogFill.style.width = `${Math.min(100, this.count/this.target*100)}%`;
+          setProgress(`${this.count}/${this.target}`);
+          setState('閉口');
+          if (this.count >= this.target) {
+            endGame('熱狗切完！', `你完成 ${this.count} 次咀嚼，用時 ${timeText.textContent}`);
+          }
+        }
+      };
+    }
+
+    async function initCameraAndFaceMesh(){
+      // 建立 FaceMesh
+      if (!faceMesh) {
+        faceMesh = new FaceMesh.FaceMesh({
+          locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+        });
+        faceMesh.setOptions({
+          maxNumFaces: 1,
+          refineLandmarks: true,
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.5
+        });
+        faceMesh.onResults(onResults);
+      }
+
+      // 啟用相機
+      camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: 320, height: 240 }, audio: false });
+      cam.srcObject = camStream;
+      await cam.play();
+
+      // 使用 Camera Utils 將 video 幀送入 FaceMesh
+      if (!camera) {
+        camera = new Camera(cam, {
+          onFrame: async () => { await faceMesh.send({ image: cam }); },
+          width: 320,
+          height: 240
+        });
+      }
+      camera.start();
+    }
+
+    function onResults(res){
+      octx.clearRect(0,0,camOverlay.width, camOverlay.height);
+      if (!res.multiFaceLandmarks || res.multiFaceLandmarks.length === 0) {
+        setState('找不到臉，請對準相機');
+        return;
+      }
+      const lm = res.multiFaceLandmarks[0]; // normalized
+      // 可選：畫嘴部
+      const lipIdx = [61,146,91,181,84,17,314,405,321,375,291,308,324,318,402,317,14,87,178,88,95,185,40,39,37,0,267,269,270,409,415,310,311,312,13,82];
+      octx.strokeStyle = '#22c55e'; octx.lineWidth = 2;
+      octx.beginPath();
+      for (let i=0;i<lipIdx.length;i++){
+        const p = lm[lipIdx[i]];
+        const x = p.x * camOverlay.width;
+        const y = p.y * camOverlay.height;
+        if (i===0) octx.moveTo(x,y); else octx.lineTo(x,y);
+      }
+      octx.closePath(); octx.stroke();
+
+      // 計算 MAR
+      const top = lm[13], bottom = lm[14], left = lm[78], right = lm[308];
+      const mar = dist2D(top, bottom) / Math.max(1e-6, dist2D(left, right));
+
+      // 更新到熱狗遊戲
+      if (game && game.updateMAR) game.updateMAR(mar);
     }
 
     // ====== 遊戲生命週期 ======
     async function startGame() {
       hideResult();
-      await initAudio();
       startTime = performance.now();
       setProgress(0);
-      setState('偵測中…');
+      setState('準備中…');
 
-      // 顯示對應 UI
+      // 切換 UI
       document.getElementById('hotdogUI').classList.add('hidden');
       document.getElementById('lollipopUI').classList.add('hidden');
 
+      // 依模式初始化
       if (modeSel.value === 'balloon') {
         balloonCanvas.classList.remove('hidden');
+        await initAudio(); // 需要麥克風
         drawBalloon(20);
         game = new BalloonGame(100);
       } else if (modeSel.value === 'hotdog') {
         balloonCanvas.classList.add('hidden');
         document.getElementById('hotdogUI').classList.remove('hidden');
         game = new HotdogGame(12);
+        await initCameraAndFaceMesh(); // 啟動相機 + FaceMesh
       } else {
         balloonCanvas.classList.add('hidden');
         document.getElementById('lollipopUI').classList.remove('hidden');
+        await initAudio(); // 需要麥克風
         game = new LollipopGame(20);
       }
 
@@ -311,12 +399,10 @@
       setState('完成');
       stopLoopKeepMic();
     }
-
     function stopLoopKeepMic(){
       if (rafId) cancelAnimationFrame(rafId);
       rafId = null;
     }
-
     function resetAll(){
       stopLoopKeepMic();
       setProgress(0);
@@ -324,20 +410,32 @@
       setState('待機');
       hideResult();
       game = null;
+
+      // 清畫面
       bctx.clearRect(0,0,balloonCanvas.width, balloonCanvas.height);
       hotdogFill.style.width = '0%';
       lollipopFill.style.width = '0%';
-      balloonCanvas.classList.remove('hidden'); // 預設顯示畫布
+
+      // 關相機
+      if (camStream) { camStream.getTracks().forEach(t=>t.stop()); camStream = null; }
+      if (camera) { try { camera.stop(); } catch(e){} camera = null; }
+
+      // 不強制關麥克風（保留使用者同意），但可在此關閉：
+      // if (micStream) { micStream.getTracks().forEach(t=>t.stop()); micStream = null; audioCtx = null; analyser = null; }
+
+      // 預設顯示氣球畫布
+      balloonCanvas.classList.remove('hidden');
+      octx.clearRect(0,0,camOverlay.width, camOverlay.height);
     }
 
-    // 事件
     startBtn.addEventListener('click', startGame);
     resetBtn.addEventListener('click', resetAll);
     againBtn.addEventListener('click', resetAll);
 
-    // 離開頁面時關麥克風
+    // 離開頁面時收乾淨
     window.addEventListener('beforeunload', () => {
       if (micStream) micStream.getTracks().forEach(t => t.stop());
+      if (camStream) camStream.getTracks().forEach(t => t.stop());
     });
   </script>
 </body>
